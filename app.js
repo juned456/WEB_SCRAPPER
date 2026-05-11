@@ -1,4 +1,3 @@
-// app.js
 const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
@@ -32,7 +31,6 @@ function sleep(ms) {
  */
 async function fetchScreenerPage(page) {
   const url = page === 1 ? SCREENER_BASE : `${SCREENER_BASE}?page=${page}`;
-  //console.log("Scraping Screener page:", url);
 
   const res = await axios.get(url, {
     headers: {
@@ -43,11 +41,7 @@ async function fetchScreenerPage(page) {
   });
 
   const $ = cheerio.load(res.data);
-  // console.log(
-  //   `DEBUG page ${page}: tables=${$("table").length}, companyLinks=${
-  //     $('a[href^="/company/"]').length
-  //   }`
-  // );
+
   // Pick the table that actually contains company links
   const table = $("table")
     .filter((i, el) => {
@@ -56,11 +50,11 @@ async function fetchScreenerPage(page) {
     .first();
 
   if (!table.length) {
-    console.log("❌ No company table found on this page");
+    console.log("No company table found on this page");
     return [];
   }
 
-  // --- normalize header text into safe keys, like "CMP Rs." -> "cmp_rs"
+  // Normalize header text into safe keys, like "CMP Rs." -> "cmp_rs"
   const rawHeaders = [];
   const normHeaders = [];
 
@@ -78,6 +72,7 @@ async function fetchScreenerPage(page) {
     rawHeaders[i] = label;
     normHeaders[i] = normalizeHeader(label);
   });
+
   const rows = [];
 
   table
@@ -95,7 +90,7 @@ async function fetchScreenerPage(page) {
       const parts = href.split("/").filter(Boolean); // ["company","PARADEEP","consolidated"]
       if (parts.length < 2 || parts[0].toLowerCase() !== "company") return;
 
-      const symbol = parts[1].toUpperCase(); // PARADEEP
+      const symbol = parts[1].toUpperCase(); // PARADEEP or 514448
 
       const cells = $tr.find("td");
       const row = {
@@ -111,7 +106,7 @@ async function fetchScreenerPage(page) {
       cells.each((i, td) => {
         if (i < 2) return; // skip S.No + Name
 
-        const headerIndex = i; // NO +1 needed now
+        const headerIndex = i;
         const text = $(td).text().replace(/\s+/g, " ").trim();
 
         const rawHeader = rawHeaders[headerIndex];
@@ -154,16 +149,6 @@ async function fetchScreenerPage(page) {
       rows.push(row);
     });
 
-  //console.log(`Stock rows on this page: ${rows.length}`);
-
-  // Debug: show headers + first row mapping once
-  if (rows.length && page === 1) {
-    // console.log("DEBUG rawHeaders:", rawHeaders);
-    // console.log("DEBUG normHeaders:", normHeaders);
-    // console.log("DEBUG first row keys:", Object.keys(rows[0]));
-    // console.log("DEBUG first row:", rows[0]);
-  }
-  //console.log(`Page ${page}: tables=${$("table").length}, rows=${rows.length}`);
   return rows;
 }
 
@@ -191,49 +176,55 @@ async function fetchAllScreenerRows() {
 
     // If page brings no new stocks, stop (same page repeated)
     if (newRows === 0) {
-      console.log(`🛑 Page ${page} repeated, stopping pagination`);
+      console.log(`Page ${page} repeated, stopping pagination`);
       break;
     }
   }
 
-  console.log("✅ Total unique Screener rows:", all.length);
+  console.log("Total unique Screener rows:", all.length);
   return all;
+}
+
+function getMusaffaSymbolCandidates(token) {
+  const cleanToken = String(token || "")
+    .replace(/[^a-z0-9]/gi, "")
+    .toUpperCase();
+
+  if (!cleanToken) return [];
+
+  const exchangeSymbol = /^\d{6}$/.test(cleanToken)
+    ? `${cleanToken}.BO`
+    : `${cleanToken}.NS`;
+
+  return [exchangeSymbol, cleanToken];
 }
 
 /**
  * Call Musaffa for a given token.
- * Tries TOKEN.NS, then TOKEN.
- * Returns parsed JSON or null.
+ * For 6 digit BSE codes like 514448, tries 514448.BO first.
+ * For other symbols, tries TOKEN.NS first.
+ * Then falls back to TOKEN.
  */
 async function fetchMusaffaDoc(token) {
-  const symbolNS = token.toUpperCase() + ".NS"; // e.g. RELIANCE.NS
-  const primaryUrl = MUSAFFA_BASE + encodeURIComponent(symbolNS);
-  const fallbackUrl = MUSAFFA_BASE + encodeURIComponent(token.toUpperCase());
-
   const headers = {
     Accept: "application/json",
     "X-Typesense-Api-Key": MUSAFFA_KEY,
     "User-Agent": "Node-MusaffaFetcher/1.0",
   };
 
-  try {
-    const res = await axios.get(primaryUrl, { headers, timeout: 15000 });
-    //console.log("Musaffa OK:", symbolNS, "status:", res.status);
-    return res.data;
-  } catch (e1) {
-    const code = e1.response?.status;
-    //console.log("Primary Musaffa failed for", symbolNS, "status:", code);
+  for (const symbol of getMusaffaSymbolCandidates(token)) {
+    const url = MUSAFFA_BASE + encodeURIComponent(symbol);
 
     try {
-      const res2 = await axios.get(fallbackUrl, { headers, timeout: 15000 });
-      //console.log( "Musaffa fallback OK:", token.toUpperCase(), "status:", res2.status);
-      return res2.data;
-    } catch (e2) {
-      const code2 = e2.response?.status;
-      //console.log("Musaffa failed for both",  symbolNS, "and", "statuses:", code, "and", code2 );
-      return null;
+      const res = await axios.get(url, { headers, timeout: 15000 });
+      return res.data;
+    } catch (e) {
+      const code = e.response?.status || e.code || "unknown";
+      console.log("Musaffa lookup failed for", symbol, "status:", code);
     }
   }
+
+  return null;
 }
 
 /**
@@ -305,7 +296,6 @@ function findAnyCompliantByRelatedKey(data) {
 
 // Utility to remove duplicates
 function dedupeRows(rows) {
-  //console.log("Dedupe rows, original count:", rows);
   const map = {};
   rows.forEach((r) => {
     if (r.Symbol) map[r.Symbol] = r;
@@ -318,7 +308,7 @@ function dedupeRows(rows) {
 // Home
 app.get("/", (req, res) => {
   res.send(
-    `<h2>Go to <a href="/sharia-tables">/sharia-tables</a> to view Shariah-compliant Screener stocks</h2>`
+    '<h2>Go to <a href="/sharia-tables">/sharia-tables</a> to view Shariah-compliant Screener stocks</h2>'
   );
 });
 
@@ -328,7 +318,6 @@ app.get("/sharia-tables", async (req, res) => {
 
     // remove duplicates by Symbol
     const uniqueRows = dedupeRows(rawRows);
-    //console.log("Unique rows after dedupe:", uniqueRows[0]);
     const enriched = [];
 
     for (const row of uniqueRows) {
@@ -389,13 +378,13 @@ app.get("/sharia-tables", async (req, res) => {
       });
     }
 
-    // ✅ cache for Excel download
+    // cache for Excel download
     global.cachedCompliantStocks = compliant;
 
     // HTML generator
-    function buildTable(title, items, sortKey, orderParam) {
+    function buildTable(title, items, currentSortKey, currentOrderParam) {
       const nextOrder = (key) =>
-        sortKey === key && orderParam === "asc" ? "desc" : "asc";
+        currentSortKey === key && currentOrderParam === "asc" ? "desc" : "asc";
       let html = `
       <a href="/download-excel" style="font-size:16px; margin-bottom:20px; display:inline-block;">
         Download Excel
@@ -453,7 +442,7 @@ app.get("/sharia-tables", async (req, res) => {
         </tr>`;
       });
 
-      html += `</table><br><hr><br>`;
+      html += "</table><br><hr><br>";
       return html;
     }
 
@@ -465,31 +454,34 @@ app.get("/sharia-tables", async (req, res) => {
           body { font-family: Arial; padding: 20px; }
           table { width: 100%; border-collapse: collapse; }
           th {
-  background: #f5f7fa;
-  color: #222;
-  font-weight: 600;
-}
-
-th a {
-  color: #0b5ed7;        /* readable blue */
-  text-decoration: none;
-}
-
-th a:hover {
-  text-decoration: underline;
-}
+            background: #f5f7fa;
+            color: #222;
+            font-weight: 600;
+          }
+          th a {
+            color: #0b5ed7;
+            text-decoration: none;
+          }
+          th a:hover {
+            text-decoration: underline;
+          }
           td, th { padding: 6px 10px; }
         </style>
       </head>
       <body>
-       <h1>Screener + Musaffa Shariah Screening</h1>
-    ${buildTable("✔ Shariah-Compliant Stocks", compliant, sortKey, orderParam)}
-    ${buildTable(
-      "✖ Non-Compliant / Questionable / Unknown",
-      nonCompliant,
-      sortKey,
-      orderParam
-    )}
+        <h1>Screener + Musaffa Shariah Screening</h1>
+        ${buildTable(
+          "Shariah-Compliant Stocks",
+          compliant,
+          sortKey,
+          orderParam
+        )}
+        ${buildTable(
+          "Non-Compliant / Questionable / Unknown",
+          nonCompliant,
+          sortKey,
+          orderParam
+        )}
       </body>
       </html>
     `);
@@ -502,7 +494,7 @@ th a:hover {
 app.get("/download-excel", async (req, res) => {
   const ExcelJS = require("exceljs");
 
-  // 🔑 Re-fetch fresh data
+  // Re-fetch fresh data
   const rawRows = await fetchAllScreenerRows();
   const uniqueRows = dedupeRows(rawRows);
 
@@ -563,5 +555,5 @@ app.get("/download-excel", async (req, res) => {
 // --- START SERVER -------------------------------------------
 
 app.listen(PORT, () => {
-  console.log(`Server running → http://localhost:${PORT}`);
+  console.log(`Server running -> http://localhost:${PORT}`);
 });
