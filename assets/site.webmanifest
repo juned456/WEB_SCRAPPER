@@ -1,0 +1,19 @@
+{
+  "id": "/sharia-tables",
+  "name": "Shariah Stock Monitor",
+  "short_name": "Shariah Stocks",
+  "description": "Monitor Shariah-compliant stocks and copy an updated TradingView watchlist.",
+  "start_url": "/sharia-tables",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f3f5f4",
+  "theme_color": "#08795b",
+  "icons": [
+    {
+      "src": "/assets/pushover-stock-icon-128.png",
+      "sizes": "128x128",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
