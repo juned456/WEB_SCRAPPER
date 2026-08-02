@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.playwright-cli
+data
+node_modules
+npm-debug.log*
+output
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

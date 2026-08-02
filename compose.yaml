@@ -1,0 +1,27 @@
+name: sharia-stock-monitor
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sharia-stock-monitor:latest
+    container_name: sharia-stock-monitor
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3002}:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      SQLITE_PATH: /app/data/sharia-monitor.sqlite
+      TZ: ${TZ:-Asia/Kolkata}
+      MUSAFFA_API_KEY: ${MUSAFFA_API_KEY:-}
+    volumes:
+      - sharia-monitor-data:/app/data
+
+volumes:
+  sharia-monitor-data:
+    name: sharia-monitor-data
