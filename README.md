@@ -96,3 +96,19 @@ docker compose down
 
 Keep exactly one `app` container running. Multiple replicas can compete for
 the same SQLite file.
+
+### Automatic production deployment
+
+Every push to `main` runs `.github/workflows/deploy-production.yml`. It tests
+the project, publishes an immutable Docker image, updates the existing aaPanel
+Compose project over SSH, verifies `/api/status`, and rolls back on failure.
+
+Configure these secrets once in the repository's `Production` environment:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+- `PROD_HOST`
+- `PROD_USER`
+- `PROD_SSH_KEY`
+- `PROD_KNOWN_HOSTS`
+- `PROD_SSH_PORT` (optional; defaults to `22`)
