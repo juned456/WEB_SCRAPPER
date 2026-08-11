@@ -1,5 +1,7 @@
 const assert = require("node:assert/strict");
+const { mock } = require("node:test");
 const test = require("node:test");
+const axios = require("axios");
 const {
   buildNotificationMessage,
   deriveCircuitBand,
@@ -8,6 +10,7 @@ const {
   formatTradingViewList,
   formatTradingViewSymbol,
   getThreeYearIpoWindow,
+  isAfterShariaMarketClose,
   isExcludedCircuitBand,
   isWithinIpoWindow,
   parseIpoCompanyClassification,
@@ -16,7 +19,9 @@ const {
   parseRecentIpoHtml,
   parseSecuritySeries,
   parseSecurityPriceRanges,
-  splitMessage,
+  reconstructDailyShariaBaseline,
+  sendNotification,
+  selectShariaNotificationChanges,
 } = require("./monitor");
 
 const previous = [
@@ -66,25 +71,125 @@ test("uses Musaffa exchange metadata for an alphanumeric BSE symbol", () => {
   );
 });
 
-test("notification includes additions, deletions, and complete updated list", () => {
+test("notification contains one compact added/deleted summary only", () => {
   const difference = diffStockLists(previous, current);
-  const message = buildNotificationMessage({
-    ...difference,
-    current,
-  });
-  assert.match(message, /Added \(2\): 514448 BSE Company, NEW New Limited/);
-  assert.match(message, /Deleted \(1\): OLD Old Limited/);
-  assert.match(message, /Updated list: 514448 BSE Company/);
-  assert.match(message, /TradingView: BSE:514448,NSE:KEEP,NSE:NEW/);
+  const message = buildNotificationMessage(difference);
+  assert.equal(message, "Added (2): 514448, NEW\nDeleted (1): OLD");
+  assert.equal(message.includes("Updated list"), false);
+  assert.equal(message.includes("TradingView"), false);
+  assert.equal(message.length <= 900, true);
 });
 
-test("splits long push messages without losing content", () => {
-  const message = Array.from({ length: 50 }, (_, index) => `STOCK${index}`)
-    .join(", ");
-  const chunks = splitMessage(message, 80);
-  assert.ok(chunks.length > 1);
-  assert.ok(chunks.every((chunk) => chunk.length <= 80));
-  assert.equal(chunks.join(", "), message);
+test("reconstructs the opening list after a mid-day deployment", () => {
+  const baseline = reconstructDailyShariaBaseline(
+    [
+      { symbol: "STABLE", name: "Stable" },
+      { symbol: "CURRENT", name: "Current" },
+    ],
+    [
+      { eventType: "ADDED", symbol: "CURRENT", name: "Current" },
+      { eventType: "DELETED", symbol: "CHURN", name: "Churn" },
+      { eventType: "ADDED", symbol: "CHURN", name: "Churn" },
+    ]
+  );
+  assert.deepEqual(baseline, [{ symbol: "STABLE", name: "Stable" }]);
+});
+
+test("an added stock notifies once even after delete and re-add churn", () => {
+  const first = selectShariaNotificationChanges({
+    baseline: [{ symbol: "OPENING", name: "Opening" }],
+    current: [
+      { symbol: "OPENING", name: "Opening" },
+      { symbol: "NEW", name: "New" },
+    ],
+    notifiedAddedSymbols: [],
+    notifiedDeletedSymbols: [],
+    afterClose: false,
+  });
+  assert.deepEqual(first.added, [{ symbol: "NEW", name: "New" }]);
+
+  const readded = selectShariaNotificationChanges({
+    baseline: [{ symbol: "OPENING", name: "Opening" }],
+    current: [
+      { symbol: "OPENING", name: "Opening" },
+      { symbol: "NEW", name: "New" },
+    ],
+    notifiedAddedSymbols: ["NEW"],
+    notifiedDeletedSymbols: [],
+    afterClose: true,
+  });
+  assert.deepEqual(readded, { added: [], removed: [] });
+});
+
+test("deletions wait until 15:35 IST and notify once", () => {
+  assert.equal(
+    isAfterShariaMarketClose(new Date("2026-08-11T10:04:00.000Z")),
+    false
+  );
+  assert.equal(
+    isAfterShariaMarketClose(new Date("2026-08-11T10:05:00.000Z")),
+    true
+  );
+
+  const beforeClose = selectShariaNotificationChanges({
+    baseline: [{ symbol: "DELETED", name: "Deleted" }],
+    current: [],
+    notifiedAddedSymbols: [],
+    notifiedDeletedSymbols: [],
+    afterClose: false,
+  });
+  assert.deepEqual(beforeClose, { added: [], removed: [] });
+
+  const afterClose = selectShariaNotificationChanges({
+    baseline: [{ symbol: "DELETED", name: "Deleted" }],
+    current: [],
+    notifiedAddedSymbols: [],
+    notifiedDeletedSymbols: [],
+    afterClose: true,
+  });
+  assert.deepEqual(afterClose.removed, [
+    { symbol: "DELETED", name: "Deleted" },
+  ]);
+});
+
+test("large daily changes stay inside one Pushover message", () => {
+  const message = buildNotificationMessage({
+    added: Array.from({ length: 150 }, (_, index) => ({
+      symbol: `ADD${index}`,
+      name: `Added ${index}`,
+    })),
+    removed: Array.from({ length: 150 }, (_, index) => ({
+      symbol: `DEL${index}`,
+      name: `Deleted ${index}`,
+    })),
+  });
+  assert.equal(message.length <= 900, true);
+  assert.match(message, /\(\+\d+ more\)/);
+});
+
+test("sends exactly one Pushover request without a numbered title", async () => {
+  const post = mock.method(axios, "post", async () => ({ status: 200 }));
+  try {
+    await sendNotification(
+      {
+        configured: true,
+        appToken: "app",
+        userKey: "user",
+        device: "",
+        url: "",
+      },
+      "Shariah changes: +3 / -0",
+      "A".repeat(1200)
+    );
+    assert.equal(post.mock.callCount(), 1);
+    const [, payload] = post.mock.calls[0].arguments;
+    assert.equal(payload.title, "Shariah changes: +3 / -0");
+    assert.equal(payload.title.includes("/"), true);
+    assert.equal(payload.title.includes("(1/"), false);
+    assert.equal(payload.message.length, 900);
+  } finally {
+    post.mock.restore();
+  }
 });
 
 test("parses the official NSE price-band list and prefers EQ series", () => {

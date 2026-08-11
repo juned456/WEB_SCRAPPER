@@ -18,6 +18,9 @@ const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_INTERVAL_MS = 60 * 1000;
 const DEFAULT_IPO_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MIN_IPO_INTERVAL_MS = 60 * 60 * 1000;
+const DAILY_NOTIFICATION_STATE_KEY = "daily_notification_state_v2";
+const NOTIFICATION_MIGRATION_KEY = "notification_dedupe_migration_v2";
+const AFTER_CLOSE_NOTIFICATION_MINUTE_IST = 15 * 60 + 35;
 const EXCLUDED_CIRCUIT_BANDS = new Set([2, 5]);
 const MAINBOARD_EQUITY_SERIES = new Set(["EQ", "BE", "BZ", "T0"]);
 const IPO_MONTHS = new Map(
@@ -344,51 +347,135 @@ function diffStockLists(previousStocks, currentStocks) {
   };
 }
 
-function buildNotificationMessage({ added, removed, current, baseline = false }) {
-  const lines = [];
-
-  if (baseline) {
-    lines.push(`Initial compliant list saved (${current.length}).`);
-  } else {
-    lines.push(`Shariah-compliant list changed (${current.length} total).`);
-    lines.push(
-      added.length
-        ? `Added (${added.length}): ${formatStockPairs(added)}`
-        : "Added (0): None"
-    );
-    lines.push(
-      removed.length
-        ? `Deleted (${removed.length}): ${formatStockPairs(removed)}`
-        : "Deleted (0): None"
-    );
+function formatChangedSymbols(stocks, maxLength = 380) {
+  const symbols = [...new Set(sortStocks(stocks).map((stock) => stock.symbol))];
+  const visible = [];
+  for (const symbol of symbols) {
+    if ([...visible, symbol].join(", ").length > maxLength) break;
+    visible.push(symbol);
   }
-
-  lines.push(`Updated list: ${formatStockPairs(current) || "Empty"}`);
-  lines.push(
-    `TradingView: ${formatTradingViewList(current) || "No symbols available"}`
-  );
-  return lines.join("\n\n");
+  const remaining = symbols.length - visible.length;
+  return `${visible.join(", ")}${remaining > 0 ? ` (+${remaining} more)` : ""}` || "None";
 }
 
-function splitMessage(message, maxLength) {
-  if (message.length <= maxLength) return [message];
+function buildNotificationMessage({ added, removed }) {
+  return [
+    added.length
+      ? `Added (${added.length}): ${formatChangedSymbols(added)}`
+      : "Added (0): None",
+    removed.length
+      ? `Deleted (${removed.length}): ${formatChangedSymbols(removed)}`
+      : "Deleted (0): None",
+  ].join("\n");
+}
 
-  const chunks = [];
-  let remaining = message;
-
-  while (remaining.length > maxLength) {
-    let splitAt = remaining.lastIndexOf(", ", maxLength);
-    if (splitAt < Math.floor(maxLength * 0.5)) {
-      splitAt = remaining.lastIndexOf("\n", maxLength);
-    }
-    if (splitAt < Math.floor(maxLength * 0.5)) splitAt = maxLength;
-
-    chunks.push(remaining.slice(0, splitAt).trim());
-    remaining = remaining.slice(splitAt).replace(/^,\s*/, "").trim();
+function reconstructDailyShariaBaseline(current, eventsNewestFirst) {
+  const baseline = new Map(
+    current.map((stock) => {
+      const normalized = normalizeStock(stock);
+      return [normalized.symbol, normalized];
+    })
+  );
+  for (const event of eventsNewestFirst) {
+    const stock = normalizeStock(event);
+    if (event.eventType === "ADDED") baseline.delete(stock.symbol);
+    else baseline.set(stock.symbol, stock);
   }
+  return sortStocks([...baseline.values()]);
+}
 
-  if (remaining) chunks.push(remaining);
-  return chunks;
+function getIstNotificationClock(date) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  return {
+    dateKey: `${value("year")}-${value("month")}-${value("day")}`,
+    weekday: value("weekday"),
+    minuteOfDay: Number(value("hour")) * 60 + Number(value("minute")),
+  };
+}
+
+function isAfterShariaMarketClose(date) {
+  const clock = getIstNotificationClock(date);
+  return !["Sat", "Sun"].includes(clock.weekday) &&
+    clock.minuteOfDay >= AFTER_CLOSE_NOTIFICATION_MINUTE_IST;
+}
+
+function selectShariaNotificationChanges({
+  baseline,
+  current,
+  notifiedAddedSymbols,
+  notifiedDeletedSymbols,
+  afterClose,
+}) {
+  const opening = new Map(
+    baseline.map((stock) => {
+      const normalized = normalizeStock(stock);
+      return [normalized.symbol, normalized];
+    })
+  );
+  const closing = new Map(
+    current.map((stock) => {
+      const normalized = normalizeStock(stock);
+      return [normalized.symbol, normalized];
+    })
+  );
+  const addedAlready = new Set(
+    notifiedAddedSymbols.map((symbol) => String(symbol).toUpperCase())
+  );
+  const deletedAlready = new Set(
+    notifiedDeletedSymbols.map((symbol) => String(symbol).toUpperCase())
+  );
+  const added = sortStocks(
+    [...closing.values()].filter(
+      (stock) => !opening.has(stock.symbol) && !addedAlready.has(stock.symbol)
+    )
+  );
+  const tracked = new Map(opening);
+  for (const symbol of [...addedAlready, ...added.map((stock) => stock.symbol)]) {
+    if (!tracked.has(symbol)) tracked.set(symbol, { symbol, name: symbol });
+  }
+  const removed = afterClose
+    ? sortStocks(
+        [...tracked.values()].filter(
+          (stock) => !closing.has(stock.symbol) && !deletedAlready.has(stock.symbol)
+        )
+      )
+    : [];
+  return { added, removed };
+}
+
+function parseDailyNotificationState(value) {
+  if (!value) return null;
+  const parsed = safeJsonParse(value, null);
+  if (!parsed || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.dateKey || "") ||
+      !Array.isArray(parsed.baseline)) {
+    return null;
+  }
+  return {
+    dateKey: parsed.dateKey,
+    baseline: parsed.baseline.map(normalizeStock).filter((stock) => stock.symbol),
+    notifiedAddedSymbols: Array.isArray(parsed.notifiedAddedSymbols)
+      ? parsed.notifiedAddedSymbols.map((symbol) => String(symbol).toUpperCase())
+      : [],
+    notifiedDeletedSymbols: Array.isArray(parsed.notifiedDeletedSymbols)
+      ? parsed.notifiedDeletedSymbols.map((symbol) => String(symbol).toUpperCase())
+      : [],
+  };
+}
+
+function getIstDayUtcBounds(dateKey) {
+  const start = new Date(`${dateKey}T00:00:00+05:30`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { start: start.toISOString(), end: end.toISOString() };
 }
 
 function getNotificationConfig(env = process.env) {
@@ -406,29 +493,23 @@ function getNotificationConfig(env = process.env) {
 }
 
 async function sendPushover(config, title, message) {
-  const chunks = splitMessage(message, 900);
+  const payload = {
+    token: config.appToken,
+    user: config.userKey,
+    title,
+    message: message.length > 900 ? `${message.slice(0, 899)}…` : message,
+  };
 
-  for (let index = 0; index < chunks.length; index++) {
-    const chunkTitle =
-      chunks.length > 1 ? `${title} (${index + 1}/${chunks.length})` : title;
-    const payload = {
-      token: config.appToken,
-      user: config.userKey,
-      title: chunkTitle,
-      message: chunks[index],
-    };
-
-    if (config.device) payload.device = config.device;
-    if (config.url) {
-      payload.url = config.url;
-      payload.url_title = "Open Shariah monitor";
-    }
-
-    await axios.post("https://api.pushover.net/1/messages.json", payload, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 20000,
-    });
+  if (config.device) payload.device = config.device;
+  if (config.url) {
+    payload.url = config.url;
+    payload.url_title = "Open Shariah monitor";
   }
+
+  await axios.post("https://api.pushover.net/1/messages.json", payload, {
+    headers: { "Content-Type": "application/json" },
+    timeout: 20000,
+  });
 }
 
 async function sendNotification(config, title, message) {
@@ -503,10 +584,6 @@ class ShariaMonitor {
       1000;
     this.maxPages =
       Number(options.maxPages) || Number(process.env.MAX_SCREENER_PAGES) || 10;
-    this.notifyOnInitial =
-      String(process.env.NOTIFY_ON_INITIAL_SNAPSHOT || "false").toLowerCase() ===
-      "true";
-
     this.dbPath =
       options.dbPath ||
       process.env.SQLITE_PATH ||
@@ -633,6 +710,31 @@ class ShariaMonitor {
       SET first_seen_at = updated_at
       WHERE first_seen_at IS NULL
     `);
+
+    if (this.getState(NOTIFICATION_MIGRATION_KEY) !== "true") {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`
+          UPDATE notification_outbox
+          SET status = 'superseded',
+              last_error = 'Replaced by deduplicated daily Shariah notifications.'
+          WHERE status IN ('pending', 'failed', 'waiting_for_configuration');
+
+          UPDATE poll_runs
+          SET notification_status = 'superseded'
+          WHERE id IN (
+            SELECT poll_run_id
+            FROM notification_outbox
+            WHERE status = 'superseded'
+          );
+        `);
+        this.setState(NOTIFICATION_MIGRATION_KEY, "true");
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
   }
 
   getState(key) {
@@ -652,6 +754,24 @@ class ShariaMonitor {
 
   isInitialized() {
     return this.getState("initialized") === "true";
+  }
+
+  loadDailyOpeningBaseline(dateKey, currentCompliant) {
+    const bounds = getIstDayUtcBounds(dateKey);
+    const events = this.db
+      .prepare(`
+        SELECT event_type, symbol, name
+        FROM stock_events
+        WHERE created_at >= ? AND created_at < ?
+        ORDER BY id DESC
+      `)
+      .all(bounds.start, bounds.end)
+      .map((event) => ({
+        eventType: event.event_type,
+        symbol: event.symbol,
+        name: event.name,
+      }));
+    return reconstructDailyShariaBaseline(currentCompliant, events);
   }
 
   getCurrentStocks() {
@@ -1511,6 +1631,9 @@ class ShariaMonitor {
       (stock) => stock.compliance === "COMPLIANT"
     );
     const baseline = !this.isInitialized();
+    const storedDailyState = parseDailyNotificationState(
+      this.getState(DAILY_NOTIFICATION_STATE_KEY)
+    );
 
     try {
       const observed = await this.buildObservedStocks(previousStocks);
@@ -1523,6 +1646,46 @@ class ShariaMonitor {
       );
       const changed = !baseline && (added.length > 0 || removed.length > 0);
       const completedAt = new Date().toISOString();
+      const completedClock = getIstNotificationClock(new Date(completedAt));
+      let dailyState = storedDailyState?.dateKey === completedClock.dateKey
+        ? storedDailyState
+        : {
+            dateKey: completedClock.dateKey,
+            baseline: this.loadDailyOpeningBaseline(
+              completedClock.dateKey,
+              previousCompliant
+            ),
+            notifiedAddedSymbols: [],
+            notifiedDeletedSymbols: [],
+          };
+      if (baseline) {
+        dailyState = {
+          ...dailyState,
+          baseline: sortStocks(currentCompliant).map(normalizeStock),
+        };
+      }
+      const afterClose = isAfterShariaMarketClose(new Date(completedAt));
+      const notificationChanges = baseline
+        ? { added: [], removed: [] }
+        : selectShariaNotificationChanges({
+            baseline: dailyState.baseline,
+            current: currentCompliant,
+            notifiedAddedSymbols: dailyState.notifiedAddedSymbols,
+            notifiedDeletedSymbols: dailyState.notifiedDeletedSymbols,
+            afterClose,
+          });
+      const notificationRequired = !baseline &&
+        (notificationChanges.added.length > 0 ||
+          notificationChanges.removed.length > 0);
+      const notificationStatus = notificationRequired
+        ? "pending"
+        : baseline
+          ? "skipped_initial"
+          : changed && removed.length > 0 && !afterClose
+            ? "deferred_deletions_until_close"
+            : changed
+              ? "skipped_duplicate_or_unchanged"
+              : "skipped_unchanged";
       const listText = formatStockPairs(currentCompliant);
       const tradingViewText = formatTradingViewList(currentCompliant);
 
@@ -1548,11 +1711,7 @@ class ShariaMonitor {
             JSON.stringify(removed),
             listText,
             tradingViewText,
-            changed || (baseline && this.notifyOnInitial)
-              ? "pending"
-              : baseline
-                ? "skipped_initial"
-                : "skipped_unchanged",
+            notificationStatus,
             runId
           );
 
@@ -1568,22 +1727,35 @@ class ShariaMonitor {
           eventInsert.run(runId, "DELETED", stock.symbol, stock.name, completedAt);
         }
 
-        if (changed || (baseline && this.notifyOnInitial)) {
-          const title = baseline
-            ? "Shariah stock baseline ready"
-            : `Shariah list: +${added.length} / -${removed.length}`;
+        if (notificationRequired) {
+          const title = `${afterClose && notificationChanges.removed.length
+            ? "Shariah close"
+            : "Shariah changes"}: +${notificationChanges.added.length} / -${notificationChanges.removed.length}`;
           this.enqueueNotification(
             runId,
             title,
             buildNotificationMessage({
-              added,
-              removed,
-              current: currentCompliant,
-              baseline,
+              added: notificationChanges.added,
+              removed: notificationChanges.removed,
             }),
             completedAt
           );
         }
+
+        this.setState(
+          DAILY_NOTIFICATION_STATE_KEY,
+          JSON.stringify({
+            ...dailyState,
+            notifiedAddedSymbols: [...new Set([
+              ...dailyState.notifiedAddedSymbols,
+              ...notificationChanges.added.map((stock) => stock.symbol),
+            ])],
+            notifiedDeletedSymbols: [...new Set([
+              ...dailyState.notifiedDeletedSymbols,
+              ...notificationChanges.removed.map((stock) => stock.symbol),
+            ])],
+          })
+        );
 
         this.setState("initialized", "true");
         this.setState("last_success_at", completedAt);
@@ -1785,6 +1957,7 @@ module.exports = {
   formatTradingViewSymbol,
   getThreeYearIpoWindow,
   getNotificationConfig,
+  isAfterShariaMarketClose,
   isExcludedCircuitBand,
   isWithinIpoWindow,
   parseIpoCompanyClassification,
@@ -1793,6 +1966,7 @@ module.exports = {
   parseRecentIpoHtml,
   parseSecuritySeries,
   parseSecurityPriceRanges,
+  reconstructDailyShariaBaseline,
+  selectShariaNotificationChanges,
   sendNotification,
-  splitMessage,
 };

@@ -7,10 +7,13 @@ status, and stores the latest snapshot and change history in SQLite.
 
 - The browser page refreshes from SQLite every 5 seconds.
 - External services are checked every 5 minutes by default.
-- A push notification is queued only when a compliant symbol is added or
-  deleted. Unchanged lists do not create notifications.
-- Notifications contain additions, deletions, the complete `SYMBOL NAME`
-  comma-separated list, and a TradingView-ready symbol list.
+- A newly compliant symbol sends one immediate notification, whether it is
+  detected before or after 15:30 IST. The same symbol is not announced again
+  if it is removed and re-added during that day.
+- Deletions are consolidated after 15:35 IST. Notifications contain only the
+  added/deleted symbols and are always sent as one Pushover message.
+- The daily baseline and notified-symbol sets are stored in SQLite, so restarts
+  do not repeat already-sent changes.
 - Failed or unconfigured notifications remain in the SQLite outbox and retry
   after notification credentials are configured.
 - A failed Musaffa lookup does not remove a previously compliant stock.
@@ -92,4 +95,4 @@ docker compose down
 5. Enable SSL for the domain.
 
 Keep exactly one `app` container running. Multiple replicas can compete for
-the same SQLite file and can send duplicate notifications.
+the same SQLite file.
